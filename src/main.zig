@@ -1,8 +1,8 @@
 const std = @import("std");
 const zigimg = @import("zigimg");
 const render = @import("sdl_render.zig");
-const threading = @import("threading.zig");
-const AtomicRangeIter = threading.AtomicRangeIter;
+const utils = @import("utils.zig");
+const AtomicRangeIter = utils.AtomicRangeIter;
 const Colour = render.Colour;
 const Thread = std.Thread;
 const clock = std.Io.Clock.awake;
@@ -14,6 +14,18 @@ const partitions = 128;
 const mod_square_max = 8.0;
 const sequence_len = 100;
 
+// configurable settings (TODO: support loading these from JSON!)
+const h_frame_inc: f32 = 0.01; // TODO:
+const c_inc: f32 = 0.001;
+const z_inc: f32 = 0.006;
+const zoom_inc: f32 = 0.012;
+
+// updateable state
+var c = z32{ .re = -0.5125, .im = 0.5213 };
+var z_centre: z32 = .{ .im = 0, .re = 0 };
+var z_min: z32 = .{ .im = -1.35, .re = -2.4 };
+var z_max: z32 = .{ .im = 1.35, .re = 2.4 };
+
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
@@ -21,14 +33,14 @@ pub fn main(init: std.process.Init) !void {
     defer args_iter.deinit();
     _ = args_iter.next(); // skip the program name
 
-    var disp_width: u32 = 3200;
-    var disp_height: u32 = 1800;
+    var disp_width: u32 = 1920;
+    var disp_height: u32 = 1080;
     while (args_iter.next()) |arg| {
         const x_pos = std.ascii.findIgnoreCasePos(arg, 0, "x") orelse return error.InvalidArgs;
         disp_width = try std.fmt.parseInt(u32, arg[0..x_pos], 10);
         disp_height = try std.fmt.parseInt(u32, arg[x_pos + 1 .. arg.len], 10);
     }
-    try render.init("julia", @truncate(disp_width), @truncate(disp_height));
+    try render.init("julia", @truncate(disp_width), @truncate(disp_height), true);
     defer render.deinit();
 
     const num_hw_threads = try std.Thread.getCpuCount();
@@ -49,50 +61,59 @@ fn runDisplayLoop(
     disp_width: u32,
     disp_height: u32,
 ) !void {
-    const texture = try render.createStreamingTexture(@truncate(disp_width), @truncate(disp_height));
-    defer render.destroyStreamingTexture(texture);
     const threads = try allocator.alloc(Thread, num_threads);
-
     const pixels = try allocator.alloc(u32, disp_width * disp_height);
     defer allocator.free(pixels);
-    const c = z32{ .re = -0.5125, .im = 0.5213 };
 
-    const z_min: z32 = .{ .im = -1.35, .re = -2.4 };
-    const z_max: z32 = .{ .im = 1.35, .re = 2.4 };
-
+    const text_col = Colour.fromRgba(0xFFFFFFFF);
+    var text_buf: [128]u8 = undefined;
+    var text_c: [:0]u8 = undefined;
+    var text_z: [:0]u8 = undefined;
     var draw_buffer = [_]render.DrawCommand{
         .{ .clear = Colour.fromRgba(0x000000FF) },
-        .{ .stream_texture = .{ .texture = texture, .pixels = pixels, .width = disp_width, .height = disp_height } },
+        .{ .texture = .{ .pixels = pixels, .width = disp_width, .height = disp_height } },
+        .{ .text = .{ .string = try getTextC(text_buf[0..]), .x = 12, .y = 12, .colour = text_col } },
+        .{ .text = .{ .string = try getTextZ(text_buf[64..]), .x = 12, .y = 32, .colour = text_col } },
     };
 
+    var frame_times_ms: [60]f32 = undefined;
+    var frame_counter: usize = 0;
     var request_buffer: [8]render.Request = undefined;
     var h: f32 = 0;
-    var s: f32 = 0.5;
     var quit = false;
     var last_frame_end = clock.now(io);
     while (!quit) {
         // 1. process input
-        const input_reqs = render.getRequests(&request_buffer);
+        const input_reqs = try render.getRequests(&request_buffer);
         for (input_reqs) |r| {
-            // TODO: add support for moving location, zoom, c, etc.
             switch (r) {
                 .quit => quit = true,
-                .click, .pause => {}, // no interaction hooked up yet
+                .c_up => changeC(0, c_inc),
+                .c_left => changeC(-c_inc, 0),
+                .c_right => changeC(c_inc, 0),
+                .c_down => changeC(0, -c_inc),
+                .pan_left => pan(-z_inc, 0),
+                .pan_right => pan(z_inc, 0),
+                .pan_down => pan(0, -z_inc),
+                .pan_up => pan(0, z_inc),
+                .zoom_in => zoom(1.0 - zoom_inc),
+                .zoom_out => zoom(1.0 + zoom_inc),
+                else => {},
             }
         }
 
         // 2. compute
         var range_iter = try AtomicRangeIter.init(0, disp_height, partitions);
         for (0..num_threads) |i| {
-            const col_table = generateColourPalette(sequence_len + 1, h, 2.0, s, 0, 0, 0.01);
-            const args = .{ io, c, z_min, z_max, pixels, disp_width, disp_height, col_table[0..], &range_iter };
+            const col_table = getColourTable(sequence_len + 1, h, 1.0, 0.4, 0.001, 0, 0.01);
+            const args = .{ pixels, disp_width, disp_height, col_table[0..], &range_iter };
             threads[i] = try Thread.spawn(.{}, fillPixelValues, args);
-            h = @mod(h + 3, 360);
-            s = std.math.clamp(@mod(s + 0.01, 1.0), 0.5, 0.8);
+            h = @mod(h + h_frame_inc, 360);
         }
-
         for (0..num_threads) |i| threads[i].join();
         // 3. draw
+        text_c = try getTextC(text_buf[0..]);
+        text_z = try getTextZ(text_buf[64..]);
         try render.draw(&draw_buffer);
         // 4. frame pacing
         const t_end = clock.now(io);
@@ -101,19 +122,51 @@ fn runDisplayLoop(
             try io.sleep(.fromMicroseconds(target_frame_time_us - frame_us), clock);
         }
         last_frame_end = clock.now(io);
+        frame_counter += 1;
+        if (frame_counter == frame_times_ms.len) {
+            var total_ms: f32 = 0;
+            for (frame_times_ms) |t| total_ms += t;
+            // const avg_frame_ms: f32 = total_ms / @as(f32, @floatFromInt(frame_times_ms.len));
+            // std.debug.print("Avg. frame time = {d:.1} ms\n", .{ text, avg_frame_ms });
+            frame_counter = 0;
+        }
+        frame_times_ms[frame_counter] = 0.001 * @as(f32, @floatFromInt(frame_us));
     }
 }
 
-fn writImg(allocator: std.mem.Allocator, io: std.Io, disp_width: u32, disp_height: u32, pixels: [][]u32) !void {
-    var img = try zigimg.Image.create(allocator, disp_width, disp_height, .bgra32);
-    defer img.deinit(allocator);
-    for (pixels, 0..) |p, idx| img.pixels.bgra32[idx] = @bitCast(p);
-    var write_buffer: [zigimg.io.DEFAULT_BUFFER_SIZE]u8 = undefined;
-    try img.writeToFilePath(allocator, io, "julia.bmp", &write_buffer, .{ .bmp = .{} });
+fn fillPixelValues(
+    pixel_vals: []u32,
+    disp_width: u32,
+    disp_height: u32,
+    colour_lookup: []const u32,
+    y_iter: *AtomicRangeIter,
+) !void {
+    const re_inc: f32 = (z_max.re - z_min.re) / @as(f32, @floatFromInt(disp_width));
+    const im_inc: f32 = (z_max.im - z_min.im) / @as(f32, @floatFromInt(disp_height));
+    var total_iters: usize = 0;
+    while (y_iter.next()) |y_range| {
+        const start_y = y_range.start;
+        const end_y = y_range.end;
+        for (start_y..end_y) |i| {
+            for (0..disp_width) |j| {
+                var z_re = z_min.re + re_inc * @as(f32, @floatFromInt(j));
+                var z_im = z_min.im + im_inc * @as(f32, @floatFromInt(i));
+                var iter: u32 = 0;
+                while (iter < sequence_len) : (iter += 1) {
+                    const z_re_squared = z_re * z_re;
+                    const z_im_squared = z_im * z_im;
+                    if (z_re_squared + z_im_squared > mod_square_max) break;
+                    z_im = 2 * z_re * z_im + c.im;
+                    z_re = z_re_squared - z_im_squared + c.re;
+                }
+                pixel_vals[i * @as(usize, disp_width) + j] = colour_lookup[iter];
+                total_iters += iter;
+            }
+        }
+    }
 }
-/// h_start/h_inc are hue degrees; s_start/s_inc/l_start/l_inc are normalised to [0, 1],
-/// matching the units Colour.fromHsl expects.
-fn generateColourPalette(
+
+fn getColourTable(
     comptime n: u16,
     h_start: f32,
     h_inc: f32,
@@ -133,38 +186,43 @@ fn generateColourPalette(
     return rgb;
 }
 
-fn fillPixelValues(
-    io: std.Io,
-    c: z32,
-    min_z: z32,
-    max_z: z32,
-    pixel_vals: []u32,
-    disp_width: u32,
-    disp_height: u32,
-    colour_lookup: []const u32,
-    y_iter: *AtomicRangeIter,
-) !void {
-    const re_inc: f32 = (max_z.re - min_z.re) / @as(f32, @floatFromInt(disp_width));
-    const im_inc: f32 = (max_z.im - min_z.im) / @as(f32, @floatFromInt(disp_height));
-    var total_iters: usize = 0;
-    while (y_iter.next()) |y_range| {
-        const start_y = y_range.start;
-        const end_y = y_range.end;
-        for (start_y..end_y) |i| {
-            for (0..disp_width) |j| {
-                var z_re = min_z.re + re_inc * @as(f32, @floatFromInt(j));
-                var z_im = min_z.im + im_inc * @as(f32, @floatFromInt(i));
-                var iter: u32 = 0;
-                while (iter < sequence_len) : (iter += 1) {
-                    const z_re_squared = z_re * z_re;
-                    const z_im_squared = z_im * z_im;
-                    if (z_re_squared + z_im_squared > mod_square_max) break;
-                    z_im = 2 * z_re * z_im + c.im;
-                    z_re = z_re_squared - z_im_squared + c.re;
-                }
-                pixel_vals[i * @as(usize, disp_width) + j] = colour_lookup[iter];
-                total_iters += iter;
-            }
-        }
-    }
+fn changeC(re_inc: f32, im_inc: f32) void {
+    c = c.add(.{ .re = re_inc, .im = im_inc });
+}
+
+fn pan(re_inc: f32, im_inc: f32) void {
+    const current_extent = z_max.sub(z_min);
+
+    const offset = z32{
+        .re = current_extent.re * re_inc,
+        .im = current_extent.im * im_inc,
+    };
+    z_min = z_min.add(offset);
+    z_max = z_max.add(offset);
+    z_centre = .{
+        .re = z_min.re + 0.5 * (z_max.re - z_min.re),
+        .im = z_min.im + 0.5 * (z_max.im - z_min.im),
+    };
+}
+
+fn getTextC(buf: []u8) ![:0]u8 {
+    return try std.fmt.bufPrintSentinel(buf, "c = ({d:.4}, {d:.4})", .{ c.re, c.im }, 0);
+}
+
+fn getTextZ(buf: []u8) ![:0]u8 {
+    return try std.fmt.bufPrintSentinel(buf, "z = ({d:.4}, {d:.4})", .{ z_centre.re, z_centre.im }, 0);
+}
+
+fn zoom(scale_factor: f32) void {
+    const current_extent = z_max.sub(z_min);
+    const half_extent: z32 = .{ .re = 0.5 * current_extent.re, .im = 0.5 * current_extent.im };
+    const current_centre = z_min.add(half_extent);
+    z_min = .{
+        .re = current_centre.re - scale_factor * half_extent.re,
+        .im = current_centre.im - scale_factor * half_extent.im,
+    };
+    z_max = .{
+        .re = current_centre.re + scale_factor * half_extent.re,
+        .im = current_centre.im + scale_factor * half_extent.im,
+    };
 }
