@@ -171,7 +171,7 @@ fn getSdlFRect(rect: RectInfo) c.SDL_FRect {
     var sdl_rect: c.SDL_FRect = undefined;
     const diff = rect.max - rect.min;
     sdl_rect.x = rect.min[0];
-    sdl_rect.y = rect.max[1];
+    sdl_rect.y = rect.min[1];
     sdl_rect.w = diff[0];
     sdl_rect.h = diff[1];
     return sdl_rect;

@@ -1,5 +1,4 @@
 const std = @import("std");
-const zigimg = @import("zigimg");
 const render = @import("sdl_render.zig");
 const utils = @import("utils.zig");
 const AtomicRangeIter = utils.AtomicRangeIter;
@@ -72,6 +71,7 @@ fn runDisplayLoop(
     var draw_buffer = [_]render.DrawCommand{
         .{ .clear = Colour.fromRgba(0x000000FF) },
         .{ .texture = .{ .pixels = pixels, .width = disp_width, .height = disp_height } },
+        .{ .rectangle = .{ .colour = Colour.fromRgba(0x88888888), .min = .{ 6, 6 }, .max = .{ 182, 46 } } },
         .{ .text = .{ .string = try getTextC(text_buf[0..]), .x = 12, .y = 12, .colour = text_col } },
         .{ .text = .{ .string = try getTextZ(text_buf[64..]), .x = 12, .y = 32, .colour = text_col } },
     };
