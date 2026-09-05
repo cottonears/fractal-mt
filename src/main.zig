@@ -8,11 +8,10 @@ const Thread = std.Thread;
 const clock = std.Io.Clock.awake;
 const z32 = std.math.complex.Complex(f32);
 
-const min_threads = 1;
-const max_threads = 20;
 const partitions = 128;
 const mod_square_max = 8.0;
 const sequence_len = 100;
+const target_frame_time_us = 16_667; // ~60 fps
 
 // configurable settings (TODO: support loading these from JSON!)
 const h_frame_inc: f32 = 0.01; // TODO:
@@ -44,15 +43,13 @@ pub fn main(init: std.process.Init) !void {
     defer render.deinit();
 
     const num_hw_threads = try std.Thread.getCpuCount();
-    const num_threads: u16 = @truncate(std.math.clamp(num_hw_threads - 2, min_threads, max_threads));
+    const num_threads: u16 = @truncate(std.math.clamp(num_hw_threads - 2, 1, 16));
     std.debug.print(
         "Using {d} of {d} available hardware threads.\n",
         .{ num_threads, num_hw_threads },
     );
-    try runDisplayLoop(arena, io, num_threads, disp_width, disp_height);
+    try runDisplayLoop(arena, io, num_threads, disp_width, disp_height, true);
 }
-
-const target_frame_time_us = 16_667; // ~60 fps
 
 fn runDisplayLoop(
     allocator: std.mem.Allocator,
@@ -60,11 +57,12 @@ fn runDisplayLoop(
     num_threads: u16,
     disp_width: u32,
     disp_height: u32,
+    use_group: bool,
 ) !void {
-    const threads = try allocator.alloc(Thread, num_threads);
     const pixels = try allocator.alloc(u32, disp_width * disp_height);
     defer allocator.free(pixels);
-
+    var group: std.Io.Group = .init;
+    errdefer group.cancel(io);
     const text_col = Colour.fromRgba(0xFFFFFFFF);
     var text_buf: [128]u8 = undefined;
     var text_c: [:0]u8 = undefined;
@@ -101,16 +99,24 @@ fn runDisplayLoop(
                 else => {},
             }
         }
-
         // 2. compute
         var range_iter = try AtomicRangeIter.init(0, disp_height, partitions);
-        for (0..num_threads) |i| {
-            const col_table = getColourTable(sequence_len + 1, h, 1.0, 0.4, 0.001, 0, 0.01);
-            const args = .{ pixels, disp_width, disp_height, col_table[0..], &range_iter };
-            threads[i] = try Thread.spawn(.{}, fillPixelValues, args);
-            h = @mod(h + h_frame_inc, 360);
+        const col_table = getColourTable(sequence_len + 1, h, 1.0, 0.4, 0.001, 0, 0.01);
+        if (use_group) {
+            for (0..num_threads) |_| {
+                const args = .{ pixels, disp_width, disp_height, col_table[0..], &range_iter };
+                group.async(io, fillPixelValues, args);
+            }
+            try group.await(io);
+        } else {
+            const threads = try allocator.alloc(Thread, num_threads);
+            for (0..num_threads) |i| {
+                const args = .{ pixels, disp_width, disp_height, col_table[0..], &range_iter };
+                threads[i] = try Thread.spawn(.{}, fillPixelValues, args);
+            }
+            for (0..num_threads) |i| threads[i].join();
         }
-        for (0..num_threads) |i| threads[i].join();
+        h = @mod(h + h_frame_inc, 360);
         // 3. draw
         text_c = try getTextC(text_buf[0..]);
         text_z = try getTextZ(text_buf[64..]);
@@ -122,15 +128,14 @@ fn runDisplayLoop(
             try io.sleep(.fromMicroseconds(target_frame_time_us - frame_us), clock);
         }
         last_frame_end = clock.now(io);
-        frame_counter += 1;
-        if (frame_counter == frame_times_ms.len) {
+        frame_times_ms[frame_counter] = 0.001 * @as(f32, @floatFromInt(frame_us));
+        if (frame_counter == frame_times_ms.len - 1) {
             var total_ms: f32 = 0;
             for (frame_times_ms) |t| total_ms += t;
-            // const avg_frame_ms: f32 = total_ms / @as(f32, @floatFromInt(frame_times_ms.len));
-            // std.debug.print("Avg. frame time = {d:.1} ms\n", .{ text, avg_frame_ms });
-            frame_counter = 0;
+            const avg_frame_ms: f32 = total_ms / @as(f32, @floatFromInt(frame_times_ms.len));
+            std.debug.print("Group average frame time = {d:.1} ms\n", .{avg_frame_ms});
         }
-        frame_times_ms[frame_counter] = 0.001 * @as(f32, @floatFromInt(frame_us));
+        frame_counter = (frame_counter + 1) % frame_times_ms.len;
     }
 }
 
@@ -164,6 +169,7 @@ fn fillPixelValues(
             }
         }
     }
+    std.debug.print("total_num_iters = {d}\n", .{total_iters});
 }
 
 fn getColourTable(
